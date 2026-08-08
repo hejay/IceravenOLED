@@ -1,0 +1,160 @@
+name: Build Iceraven OLED
+
+on:
+  schedule:
+    # Daily. Upstream publishes irregularly, so this just polls.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream version was already released
+        type: boolean
+        default: false
+      publish:
+        description: Publish a release (uncheck for a test build — artifact only)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-iceraven-oled
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: fork-maintainers/iceraven-browser
+  ASSET_PATTERN: '*arm64-v8a-forkRelease.apk'
+  # Bump at your own pace. 2.11.0 is the version the existing OLED builds are
+  # known good with; 2.12.0 and 3.0.3 also exist. apktool 3.x changed CLI
+  # defaults, so test with `publish` unchecked before trusting a 3.x bump.
+  APKTOOL_VERSION: '2.11.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream for a new version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          mine=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+
+          echo "upstream latest : $upstream_tag"
+          echo "my latest       : ${mine:-<none yet>}"
+
+          if [ "$upstream_tag" = "$mine" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Already built $upstream_tag — nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          version=${upstream_tag#iceraven-}
+          echo "tag=$upstream_tag"        >> "$GITHUB_OUTPUT"
+          echo "version=$version"         >> "$GITHUB_OUTPUT"
+          echo "APK=iceraven-${version}-oled-arm64-v8a.apk" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        if: steps.check.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Put Android build-tools on PATH
+        if: steps.check.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # zipalign and apksigner ship with the runner's Android SDK. Take the
+          # newest build-tools rather than pinning a version that may vanish
+          # when GitHub rolls the image.
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "using $bt"
+          echo "$bt" >> "$GITHUB_PATH"
+
+      - name: Fetch apktool
+        if: steps.check.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          java -jar apktool.jar --version
+
+      - name: Download stock Iceraven APK
+        if: steps.check.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ steps.check.outputs.tag }}" \
+            --repo "$UPSTREAM" \
+            --pattern "$ASSET_PATTERN" \
+            --output iceraven.apk --clobber
+          ls -lh iceraven.apk
+
+      - name: Apply OLED theme
+        if: steps.check.outputs.build == 'true'
+        run: |
+          chmod +x patch-oled.sh
+          ./patch-oled.sh iceraven.apk iceraven-oled-unsigned.apk
+
+      - name: Sign
+        if: steps.check.outputs.build == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "::error::KEYSTORE_B64 secret is not set. See README step 3."
+            exit 1
+          fi
+
+          printf '%s' "$KEYSTORE_B64" | base64 -d > keystore.jks
+          apksigner sign \
+            --ks keystore.jks \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --out "$APK" \
+            iceraven-oled-unsigned.apk
+
+          rm -f keystore.jks
+          apksigner verify --print-certs "$APK"
+          sha256sum "$APK" | tee "$APK.sha256"
+
+      - name: Upload build artifact
+        if: steps.check.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iceraven-oled-${{ steps.check.outputs.version }}
+          path: |
+            ${{ env.APK }}
+            ${{ env.APK }}.sha256
+          retention-days: 14
+
+      - name: Publish release
+        if: steps.check.outputs.build == 'true' && github.event.inputs.publish != 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check.outputs.tag }}
+          name: Iceraven OLED ${{ steps.check.outputs.version }}
+          body: |
+            True-black theme applied to the official Iceraven
+            **${{ steps.check.outputs.version }}** arm64-v8a build.
+
+            Upstream release: https://github.com/${{ env.UPSTREAM }}/releases/tag/${{ steps.check.outputs.tag }}
+
+            Signed with this repository's own key. It will not install over a
+            copy of Iceraven signed by anyone else — uninstall that first.
+          files: |
+            ${{ env.APK }}
+            ${{ env.APK }}.sha256
